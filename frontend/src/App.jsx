@@ -16,6 +16,7 @@ function App() {
   const [modelInfo, setModelInfo] = useState("대기 중");
   const [lastCode, setLastCode] = useState("");
   const [codePath, setCodePath] = useState("scripts/chat_generated.py");
+  const [selectedModel, setSelectedModel] = useState("AUTO");
   const [toolBusy, setToolBusy] = useState(false);
   const [toolResult, setToolResult] = useState("");
   const [pages, setPages] = useState("1");
@@ -71,7 +72,13 @@ function App() {
       const response = await fetch(CHAT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, history: messages, last_code: lastCode, code_path: codePath }),
+        body: JSON.stringify({
+          message: text,
+          history: messages,
+          last_code: lastCode,
+          code_path: codePath,
+          selected_model: selectedModel,
+        }),
       });
 
       if (!response.ok) throw new Error(`API 오류: ${response.status}`);
@@ -163,6 +170,25 @@ function App() {
         <div className="panel">
           <div className="panel-title"><Cpu size={16} />모델 상태</div>
           <div className="model-info">{modelInfo}</div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-title"><Code2 size={16} />모델 선택</div>
+          <select
+            className="path-input"
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+          >
+            <option value="AUTO">AUTO / 자동 선택</option>
+            <option value="llama3.1:8b">llama3.1:8b / 빠른 응답</option>
+            <option value="qwen2.5:14b">qwen2.5:14b / 코드 작업</option>
+            <option value="qwen2.5:72b">qwen2.5:72b / 대형 분석</option>
+            <option value="llama3.1:70b">llama3.1:70b / 검토·검정</option>
+            <option value="llava:latest">llava:latest / 이미지</option>
+            <option value="gemma2:27b">gemma2:27b / 문서 작성</option>
+            <option value="gemma2:9b">gemma2:9b / 문장 다듬기</option>
+            <option value="gemma:7b">gemma:7b / 가벼운 대화</option>
+          </select>
         </div>
 
         <div className="panel">

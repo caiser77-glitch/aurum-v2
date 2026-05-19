@@ -55,6 +55,7 @@ class ChatRequest(BaseModel):
     history: List[Dict[str, str]] = []
     last_code: str = ""
     code_path: str = DEFAULT_CODE_PATH
+    selected_model: str = "AUTO"
 
 
 class ChatResponse(BaseModel):
@@ -397,7 +398,22 @@ def chat(req: ChatRequest):
             memory_summary=load_memory().get("summary", ""),
         )
 
-    model, reason = select_model(message)
+    allowed_models = {
+        "llama3.1:8b",
+        "qwen2.5:14b",
+        "qwen2.5:72b",
+        "llama3.1:70b",
+        "llava:latest",
+        "gemma2:27b",
+        "gemma2:9b",
+        "gemma:7b",
+    }
+
+    if req.selected_model and req.selected_model != "AUTO" and req.selected_model in allowed_models:
+        model = req.selected_model
+        reason = "사용자 지정 모델"
+    else:
+        model, reason = select_model(message)
     history.append({"role": "user", "content": message})
 
     if "저장해" in message or "코드 저장" in message:
