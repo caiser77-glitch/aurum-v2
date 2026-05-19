@@ -1,14 +1,21 @@
+import re
+import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 
 BASE = Path("/app")
+UPLOADS = BASE / "uploads"
+OUTPUTS = BASE / "outputs"
+SCRIPTS = BASE / "scripts"
+
 OLLAMA_URL = "http://host.docker.internal:11434/api/generate"
 
 MODEL_SIMPLE = "llama3.1:8b"
@@ -23,7 +30,7 @@ MODEL_SMALL = "gemma:7b"
 DEFAULT_CODE_PATH = "scripts/chat_generated.py"
 
 
-app = FastAPI(title="AURUM v2 API", version="0.1.0")
+app = FastAPI(title="AURUM v2 API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +39,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+UPLOADS.mkdir(parents=True, exist_ok=True)
+OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+app.mount("/outputs", StaticFiles(directory=str(OUTPUTS)), name="outputs")
 
 
 class ChatRequest(BaseModel):
@@ -51,6 +63,31 @@ class ChatResponse(BaseModel):
     run_result: str = ""
 
 
+def output_url(path: Path) -> str:
+    return f"/outputs/{path.name}"
+
+
+def save_upload(file: UploadFile) -> Path:
+    safe_name = Path(file.filename).name
+    target = UPLOADS / safe_name
+    with target.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return target
+
+
+def run_cmd(args: list[str]) -> str:
+    result = subprocess.run(
+        args,
+        cwd=str(BASE),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout)
+    return result.stdout.strip()
+
+
 def call_ollama(model: str, prompt: str, temperature: float = 0.2, timeout: int = 600) -> str:
     r = requests.post(
         OLLAMA_URL,
@@ -58,15 +95,21 @@ def call_ollama(model: str, prompt: str, temperature: float = 0.2, timeout: int 
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": temperature,
-                "top_p": 0.8,
-            },
+            "options": {"temperature": temperature, "top_p": 0.8},
         },
         timeout=timeout,
     )
     r.raise_for_status()
     return r.json().get("response", "").strip()
+
+
+def get_weather() -> str:
+    try:
+        r = requests.get("https://wttr.in/Seoul?format=3", timeout=20)
+        r.raise_for_status()
+        return r.text
+    except Exception as exc:
+        return f"날씨 정보를 가져오지 못했습니다: {type(exc).__name__}: {exc}"
 
 
 def select_model(message: str) -> tuple[str, str]:
@@ -108,37 +151,41 @@ def select_model(message: str) -> tuple[str, str]:
 
 def build_context(history: List[Dict[str, str]], max_messages: int = 10) -> str:
     lines = []
-
     for msg in history[-max_messages:]:
         role = msg.get("role", "")
         content = msg.get("content", "")
-
         if role == "user":
             lines.append(f"사용자: {content}")
         elif role == "assistant":
             lines.append(f"AURUM: {content}")
-
     return "\n".join(lines)
+
+
+def extract_code_block(text: str) -> str:
+    patterns = [
+        r"```python\n(.*?)```",
+        r"```py\n(.*?)```",
+        r"```\n(.*?)```",
+    ]
+    matches = []
+    for pattern in patterns:
+        matches.extend(re.findall(pattern, text, flags=re.DOTALL | re.IGNORECASE))
+    return max(matches, key=len).strip() if matches else ""
 
 
 def safe_project_path(path_text: str) -> Path:
     rel = Path(path_text.strip() or DEFAULT_CODE_PATH)
-
     if rel.is_absolute():
         raise ValueError("절대경로는 사용할 수 없습니다.")
-
     target = (BASE / rel).resolve()
-
     if not str(target).startswith(str(BASE.resolve())):
         raise ValueError("프로젝트 폴더 밖에는 저장할 수 없습니다.")
-
     return target
 
 
 def save_code(code: str, path_text: str) -> str:
     if not code.strip():
         return "저장할 코드가 없습니다."
-
     target = safe_project_path(path_text)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(code, encoding="utf-8")
@@ -147,10 +194,8 @@ def save_code(code: str, path_text: str) -> str:
 
 def run_python(path_text: str) -> str:
     target = safe_project_path(path_text)
-
     if not target.exists():
         return f"실행 실패: 파일이 없습니다: {target}"
-
     if target.suffix.lower() != ".py":
         return "실행 실패: 현재는 .py 파일만 실행 지원합니다."
 
@@ -163,42 +208,17 @@ def run_python(path_text: str) -> str:
     )
 
     output = f"실행 파일: {target}\n종료 코드: {result.returncode}\n\n"
-
     if result.stdout:
         output += "[STDOUT]\n" + result.stdout + "\n"
-
     if result.stderr:
         output += "[STDERR]\n" + result.stderr + "\n"
-
     if not result.stdout and not result.stderr:
         output += "출력 없음\n"
-
     return output
-
-
-def extract_code_block(text: str) -> str:
-    import re
-
-    patterns = [
-        r"```python\n(.*?)```",
-        r"```py\n(.*?)```",
-        r"```\n(.*?)```",
-    ]
-
-    matches = []
-
-    for pattern in patterns:
-        matches.extend(re.findall(pattern, text, flags=re.DOTALL | re.IGNORECASE))
-
-    if not matches:
-        return ""
-
-    return max(matches, key=len).strip()
 
 
 def make_prompt(message: str, history: List[Dict[str, str]], model: str, reason: str) -> str:
     context = build_context(history)
-
     return f"""
 너는 AURUM v2 통합 AI 시스템이다.
 반드시 한국어로만 답변한다.
@@ -225,17 +245,17 @@ def make_prompt(message: str, history: List[Dict[str, str]], model: str, reason:
 
 
 @app.get("/")
-def root() -> Dict[str, str]:
+def root():
     return {"status": "ok", "service": "AURUM v2 API"}
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
+def health():
     return {"status": "healthy"}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+def chat(req: ChatRequest):
     message = req.message.strip()
     history = list(req.history or [])
 
@@ -250,47 +270,24 @@ def chat(req: ChatRequest) -> ChatResponse:
         )
 
     model, reason = select_model(message)
-
     history.append({"role": "user", "content": message})
 
     if "저장해" in message or "코드 저장" in message:
         result = save_code(req.last_code, req.code_path)
         answer = f"[AURUM 코드 저장]\n{result}"
         history.append({"role": "assistant", "content": answer})
-        return ChatResponse(
-            answer=answer,
-            model="SYSTEM",
-            reason="코드 저장 명령",
-            history=history,
-            last_code=req.last_code,
-            code_path=req.code_path,
-        )
+        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 저장 명령", history=history, last_code=req.last_code, code_path=req.code_path)
 
     if "실행해" in message or "테스트해" in message or "돌려봐" in message:
         run_result = run_python(req.code_path)
         answer = f"[AURUM 코드 실행]\n{run_result}"
         history.append({"role": "assistant", "content": answer})
-        return ChatResponse(
-            answer=answer,
-            model="SYSTEM",
-            reason="코드 실행 명령",
-            history=history,
-            last_code=req.last_code,
-            code_path=req.code_path,
-            run_result=run_result,
-        )
+        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 실행 명령", history=history, last_code=req.last_code, code_path=req.code_path, run_result=run_result)
 
     if model == "WEATHER_API":
         answer = get_weather()
         history.append({"role": "assistant", "content": answer})
-        return ChatResponse(
-            answer=answer,
-            model=model,
-            reason=reason,
-            history=history,
-            last_code=req.last_code,
-            code_path=req.code_path,
-        )
+        return ChatResponse(answer=answer, model=model, reason=reason, history=history, last_code=req.last_code, code_path=req.code_path)
 
     prompt = make_prompt(message, req.history, model, reason)
     answer = call_ollama(model, prompt)
@@ -308,12 +305,48 @@ def chat(req: ChatRequest) -> ChatResponse:
 
     history.append({"role": "assistant", "content": answer})
 
-    return ChatResponse(
-        answer=answer,
-        model=model,
-        reason=reason,
-        history=history,
-        last_code=last_code,
-        code_path=code_path,
-        run_result=run_result,
-    )
+    return ChatResponse(answer=answer, model=model, reason=reason, history=history, last_code=last_code, code_path=code_path, run_result=run_result)
+
+
+@app.post("/tools/image-ocr")
+def tool_image_ocr(file: UploadFile = File(...)):
+    path = save_upload(file)
+    run_cmd(["python", str(SCRIPTS / "taxa_table_ocr.py"), str(path)])
+    out = OUTPUTS / f"{path.stem}_taxa.xlsx"
+    return {"status": "ok", "message": "이미지 OCR 완료", "file": out.name, "url": output_url(out)}
+
+
+@app.post("/tools/pdf-ocr")
+def tool_pdf_ocr(file: UploadFile = File(...), pages: str = Form("1")):
+    path = save_upload(file)
+    page_text = pages.strip() if pages and pages.strip() else ""
+    run_cmd(["python", str(SCRIPTS / "taxa_pdf_ocr.py"), str(path), page_text])
+    safe_pages = page_text.replace(",", "_").replace("-", "to").replace(" ", "") if page_text else "all"
+    out = OUTPUTS / f"{path.stem}_pages_{safe_pages}_taxa.xlsx"
+    return {"status": "ok", "message": "PDF OCR 완료", "file": out.name, "url": output_url(out)}
+
+
+@app.post("/tools/cad-kml")
+def tool_cad_kml(file: UploadFile = File(...)):
+    path = save_upload(file)
+    ext = path.suffix.lower()
+
+    if ext == ".kml":
+        mode = "kml_to_dxf"
+        out = OUTPUTS / f"{path.stem}.dxf"
+    elif ext == ".dxf":
+        mode = "dxf_to_kml"
+        out = OUTPUTS / f"{path.stem}.kml"
+    else:
+        return {"status": "error", "message": "KML 또는 DXF 파일만 지원합니다."}
+
+    log = run_cmd(["python", str(SCRIPTS / "cad_kml_convert.py"), mode, str(path), str(out)])
+    return {"status": "ok", "message": "CAD/KML 변환 완료", "file": out.name, "url": output_url(out), "log": log}
+
+
+@app.post("/tools/excel")
+def tool_excel(file: UploadFile = File(...)):
+    path = save_upload(file)
+    run_cmd(["python", str(SCRIPTS / "excel_summary.py"), str(path)])
+    out = OUTPUTS / f"{path.stem}_summary.xlsx"
+    return {"status": "ok", "message": "Excel 분석 완료", "file": out.name, "url": output_url(out)}
