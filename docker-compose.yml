@@ -13,3 +13,16 @@ services:
       - ~/aurum_docker/aurum/data:/app/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  aurum-frontend:
+    image: node:22
+    container_name: aurum-frontend
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+    command: bash -lc "npm install && npm run dev"
+    depends_on:
+      - aurum-api
