@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Send, RotateCcw, Cpu, Code2, Upload, FileText, Map, Table } from "lucide-react";
+import { Send, RotateCcw, Cpu, Code2, Upload, FileText, Map, Table, Brain, Trash2, RefreshCw } from "lucide-react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
@@ -19,6 +19,7 @@ function App() {
   const [toolBusy, setToolBusy] = useState(false);
   const [toolResult, setToolResult] = useState("");
   const [pages, setPages] = useState("1");
+  const [memory, setMemory] = useState({ summary: "", facts: [], updated_at: "" });
 
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -28,12 +29,33 @@ function App() {
   const excelRef = useRef(null);
 
   useEffect(() => {
+    loadMemory();
+  }, []);
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, [busy, tab]);
+
+  async function loadMemory() {
+    try {
+      const res = await fetch(`${API_BASE}/memory`);
+      const data = await res.json();
+      setMemory(data);
+    } catch {
+      setMemory({ summary: "기억을 불러오지 못했습니다.", facts: [], updated_at: "" });
+    }
+  }
+
+  async function clearMemory() {
+    if (!confirm("AURUM 장기 기억을 초기화할까요?")) return;
+    const res = await fetch(`${API_BASE}/memory`, { method: "DELETE" });
+    const data = await res.json();
+    setMemory(data);
+  }
 
   async function sendMessage() {
     const text = input.trim();
@@ -59,6 +81,7 @@ function App() {
       setLastCode(data.last_code || "");
       setCodePath(data.code_path || "scripts/chat_generated.py");
       setModelInfo(`${data.model} / ${data.reason}`);
+      await loadMemory();
     } catch (err) {
       setMessages([...nextMessages, { role: "assistant", content: `오류 발생:\n${err.message}` }]);
       setModelInfo("오류 발생");
@@ -111,14 +134,10 @@ function App() {
       const res = await fetch(`${API_BASE}${item.url}`, { method: "POST", body: form });
       const data = await res.json();
 
-      if (!res.ok || data.status === "error") {
-        throw new Error(data.message || `API 오류: ${res.status}`);
-      }
+      if (!res.ok || data.status === "error") throw new Error(data.message || `API 오류: ${res.status}`);
 
       const download = data.url ? `${API_BASE}${data.url}` : "";
-      setToolResult(
-        `${data.message}\n결과 파일: ${data.file || "-"}\n${download ? `다운로드: ${download}` : ""}\n${data.log ? `\n로그:\n${data.log}` : ""}`
-      );
+      setToolResult(`${data.message}\n결과 파일: ${data.file || "-"}\n${download ? `다운로드: ${download}` : ""}\n${data.log ? `\n로그:\n${data.log}` : ""}`);
     } catch (err) {
       setToolResult(`오류 발생:\n${err.message}`);
     } finally {
@@ -139,6 +158,7 @@ function App() {
 
         <button className={tab === "chat" ? "nav active" : "nav"} onClick={() => setTab("chat")}>AURUM Chat</button>
         <button className={tab === "tools" ? "nav active" : "nav"} onClick={() => setTab("tools")}>업무 도구</button>
+        <button className={tab === "memory" ? "nav active" : "nav"} onClick={() => { setTab("memory"); loadMemory(); }}>기억 보기</button>
 
         <div className="panel">
           <div className="panel-title"><Cpu size={16} />모델 상태</div>
@@ -158,7 +178,7 @@ function App() {
           <header className="chat-header">
             <div>
               <h2>AURUM Chat</h2>
-              <p>Enter 전송 · Shift+Enter 줄바꿈</p>
+              <p>Enter 전송 · Shift+Enter 줄바꿈 · 장기 기억 활성화</p>
             </div>
             <div className={busy ? "status busy" : "status"}>{busy ? "응답 생성 중" : "대기 중"}</div>
           </header>
@@ -225,6 +245,40 @@ function App() {
             </div>
 
             <pre className="tool-result">{toolResult || "결과가 여기에 표시됩니다."}</pre>
+          </section>
+        </main>
+      )}
+
+      {tab === "memory" && (
+        <main className="chat">
+          <header className="chat-header">
+            <div>
+              <h2>장기 기억</h2>
+              <p>대화 맥락을 요약 저장해서 다음 대화에 반영합니다.</p>
+            </div>
+            <div className="memory-actions">
+              <button onClick={loadMemory}><RefreshCw size={16} />새로고침</button>
+              <button onClick={clearMemory}><Trash2 size={16} />초기화</button>
+            </div>
+          </header>
+
+          <section className="tool-page">
+            <div className="memory-card">
+              <h3><Brain size={18} /> 요약</h3>
+              <pre>{memory.summary || "저장된 요약 없음"}</pre>
+              <p className="muted">업데이트: {memory.updated_at || "-"}</p>
+            </div>
+
+            <div className="memory-card">
+              <h3>중요 사실</h3>
+              {(memory.facts || []).length === 0 ? (
+                <p className="muted">저장된 중요 사실 없음</p>
+              ) : (
+                <ul>
+                  {memory.facts.map((x, i) => <li key={i}>{x}</li>)}
+                </ul>
+              )}
+            </div>
           </section>
         </main>
       )}

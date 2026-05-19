@@ -1,6 +1,8 @@
+import json
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 
@@ -15,6 +17,8 @@ BASE = Path("/app")
 UPLOADS = BASE / "uploads"
 OUTPUTS = BASE / "outputs"
 SCRIPTS = BASE / "scripts"
+DATA = BASE / "data"
+MEMORY_PATH = DATA / "memory.json"
 
 OLLAMA_URL = "http://host.docker.internal:11434/api/generate"
 
@@ -29,8 +33,7 @@ MODEL_SMALL = "gemma:7b"
 
 DEFAULT_CODE_PATH = "scripts/chat_generated.py"
 
-
-app = FastAPI(title="AURUM v2 API", version="0.2.0")
+app = FastAPI(title="AURUM v2 API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,6 +45,7 @@ app.add_middleware(
 
 UPLOADS.mkdir(parents=True, exist_ok=True)
 OUTPUTS.mkdir(parents=True, exist_ok=True)
+DATA.mkdir(parents=True, exist_ok=True)
 
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS)), name="outputs")
 
@@ -61,6 +65,102 @@ class ChatResponse(BaseModel):
     last_code: str = ""
     code_path: str = DEFAULT_CODE_PATH
     run_result: str = ""
+    memory_summary: str = ""
+
+
+class MemoryUpdateRequest(BaseModel):
+    summary: str = ""
+    facts: List[str] = []
+
+
+def default_memory():
+    return {
+        "summary": "아직 저장된 장기 기억이 없습니다.",
+        "facts": [],
+        "updated_at": "",
+    }
+
+
+def load_memory():
+    if not MEMORY_PATH.exists():
+        save_memory(default_memory())
+    try:
+        return json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        mem = default_memory()
+        save_memory(mem)
+        return mem
+
+
+def save_memory(memory: dict):
+    memory["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    MEMORY_PATH.write_text(json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def memory_text():
+    mem = load_memory()
+    facts = mem.get("facts", [])
+    fact_text = "\n".join(f"- {x}" for x in facts) if facts else "- 없음"
+    return f"""
+[장기 기억 요약]
+{mem.get("summary", "")}
+
+[중요 사실]
+{fact_text}
+"""
+
+
+def update_memory_from_chat(history: List[Dict[str, str]]):
+    if len(history) < 8:
+        return load_memory()
+
+    mem = load_memory()
+    recent = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history[-12:]])
+
+    prompt = f"""
+너는 AURUM의 장기 기억 관리자다.
+아래 기존 기억과 최근 대화를 보고, 앞으로도 유용한 프로젝트 맥락만 압축해서 갱신한다.
+민감하거나 일시적인 내용은 저장하지 않는다.
+
+기존 요약:
+{mem.get("summary", "")}
+
+기존 중요 사실:
+{mem.get("facts", [])}
+
+최근 대화:
+{recent}
+
+반드시 JSON만 출력:
+{{
+  "summary": "장기적으로 유용한 현재 프로젝트 요약",
+  "facts": ["중요 사실 1", "중요 사실 2"]
+}}
+"""
+
+    try:
+        raw = call_ollama(MODEL_WORK, prompt, timeout=600)
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return mem
+
+        new_mem = json.loads(match.group(0))
+        summary = str(new_mem.get("summary", "")).strip()
+        facts = new_mem.get("facts", [])
+
+        if not isinstance(facts, list):
+            facts = []
+
+        facts = [str(x).strip() for x in facts if str(x).strip()]
+        facts = facts[:30]
+
+        if summary:
+            mem["summary"] = summary
+        mem["facts"] = facts
+        save_memory(mem)
+        return mem
+    except Exception:
+        return mem
 
 
 def output_url(path: Path) -> str:
@@ -219,6 +319,7 @@ def run_python(path_text: str) -> str:
 
 def make_prompt(message: str, history: List[Dict[str, str]], model: str, reason: str) -> str:
     context = build_context(history)
+    mem = memory_text()
     return f"""
 너는 AURUM v2 통합 AI 시스템이다.
 반드시 한국어로만 답변한다.
@@ -226,10 +327,13 @@ def make_prompt(message: str, history: List[Dict[str, str]], model: str, reason:
 현재 선택 모델: {model}
 선택 이유: {reason}
 
+{mem}
+
 이전 대화:
 {context}
 
 중요 규칙:
+- 장기 기억을 반영해서 사용자의 프로젝트 맥락을 이어간다.
 - 코드 요청이면 반드시 실행 가능한 전체 Python 코드를 하나의 코드블록으로 제공한다.
 - 코드블록 안에는 설명, bash 명령어, 마크다운 문장, PY 같은 heredoc 종료문자를 넣지 않는다.
 - 코드블록 안에는 오직 Python 코드만 넣는다.
@@ -254,6 +358,29 @@ def health():
     return {"status": "healthy"}
 
 
+@app.get("/memory")
+def get_memory():
+    return load_memory()
+
+
+@app.post("/memory")
+def update_memory(req: MemoryUpdateRequest):
+    mem = load_memory()
+    if req.summary.strip():
+        mem["summary"] = req.summary.strip()
+    if req.facts:
+        mem["facts"] = [x.strip() for x in req.facts if x.strip()]
+    save_memory(mem)
+    return mem
+
+
+@app.delete("/memory")
+def clear_memory():
+    mem = default_memory()
+    save_memory(mem)
+    return mem
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     message = req.message.strip()
@@ -267,6 +394,7 @@ def chat(req: ChatRequest):
             history=history,
             last_code=req.last_code,
             code_path=req.code_path,
+            memory_summary=load_memory().get("summary", ""),
         )
 
     model, reason = select_model(message)
@@ -276,18 +404,21 @@ def chat(req: ChatRequest):
         result = save_code(req.last_code, req.code_path)
         answer = f"[AURUM 코드 저장]\n{result}"
         history.append({"role": "assistant", "content": answer})
-        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 저장 명령", history=history, last_code=req.last_code, code_path=req.code_path)
+        update_memory_from_chat(history)
+        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 저장 명령", history=history, last_code=req.last_code, code_path=req.code_path, memory_summary=load_memory().get("summary", ""))
 
     if "실행해" in message or "테스트해" in message or "돌려봐" in message:
         run_result = run_python(req.code_path)
         answer = f"[AURUM 코드 실행]\n{run_result}"
         history.append({"role": "assistant", "content": answer})
-        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 실행 명령", history=history, last_code=req.last_code, code_path=req.code_path, run_result=run_result)
+        update_memory_from_chat(history)
+        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 실행 명령", history=history, last_code=req.last_code, code_path=req.code_path, run_result=run_result, memory_summary=load_memory().get("summary", ""))
 
     if model == "WEATHER_API":
         answer = get_weather()
         history.append({"role": "assistant", "content": answer})
-        return ChatResponse(answer=answer, model=model, reason=reason, history=history, last_code=req.last_code, code_path=req.code_path)
+        update_memory_from_chat(history)
+        return ChatResponse(answer=answer, model=model, reason=reason, history=history, last_code=req.last_code, code_path=req.code_path, memory_summary=load_memory().get("summary", ""))
 
     prompt = make_prompt(message, req.history, model, reason)
     answer = call_ollama(model, prompt)
@@ -304,8 +435,18 @@ def chat(req: ChatRequest):
         answer += f"\n\n[AURUM 자동 처리]\n1. 코드 감지 완료\n2. {save_result}\n3. 실행 결과:\n{run_result}"
 
     history.append({"role": "assistant", "content": answer})
+    mem = update_memory_from_chat(history)
 
-    return ChatResponse(answer=answer, model=model, reason=reason, history=history, last_code=last_code, code_path=code_path, run_result=run_result)
+    return ChatResponse(
+        answer=answer,
+        model=model,
+        reason=reason,
+        history=history,
+        last_code=last_code,
+        code_path=code_path,
+        run_result=run_result,
+        memory_summary=mem.get("summary", ""),
+    )
 
 
 @app.post("/tools/image-ocr")
