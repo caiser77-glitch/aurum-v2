@@ -1,0 +1,15 @@
+services:
+  aurum-api:
+    build: ./backend
+    container_name: aurum-api
+    restart: unless-stopped
+    ports:
+      - "7870:7870"
+    volumes:
+      - ./backend:/app
+      - ~/aurum_docker/aurum/scripts:/app/scripts
+      - ~/aurum_docker/aurum/uploads:/app/uploads
+      - ~/aurum_docker/aurum/outputs:/app/outputs
+      - ~/aurum_docker/aurum/data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
