@@ -33,7 +33,7 @@ MODEL_SMALL = "gemma:7b"
 
 DEFAULT_CODE_PATH = "scripts/chat_generated.py"
 
-app = FastAPI(title="AURUM v2 API", version="0.3.0")
+app = FastAPI(title="AURUM v2 API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,12 +74,23 @@ class MemoryUpdateRequest(BaseModel):
     facts: List[str] = []
 
 
+def call_ollama(model: str, prompt: str, temperature: float = 0.2, timeout: int = 600) -> str:
+    r = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature, "top_p": 0.8},
+        },
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json().get("response", "").strip()
+
+
 def default_memory():
-    return {
-        "summary": "아직 저장된 장기 기억이 없습니다.",
-        "facts": [],
-        "updated_at": "",
-    }
+    return {"summary": "아직 저장된 장기 기억이 없습니다.", "facts": [], "updated_at": ""}
 
 
 def load_memory():
@@ -177,31 +188,10 @@ def save_upload(file: UploadFile) -> Path:
 
 
 def run_cmd(args: list[str]) -> str:
-    result = subprocess.run(
-        args,
-        cwd=str(BASE),
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
+    result = subprocess.run(args, cwd=str(BASE), capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout)
     return result.stdout.strip()
-
-
-def call_ollama(model: str, prompt: str, temperature: float = 0.2, timeout: int = 600) -> str:
-    r = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": temperature, "top_p": 0.8},
-        },
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    return r.json().get("response", "").strip()
 
 
 def get_weather() -> str:
@@ -250,6 +240,24 @@ def select_model(message: str) -> tuple[str, str]:
     return MODEL_WORK, "일반 업무"
 
 
+def choose_model(message: str, selected_model: str) -> tuple[str, str]:
+    allowed_models = {
+        "llama3.1:8b",
+        "qwen2.5:14b",
+        "qwen2.5:72b",
+        "llama3.1:70b",
+        "llava:latest",
+        "gemma2:27b",
+        "gemma2:9b",
+        "gemma:7b",
+    }
+
+    if selected_model and selected_model != "AUTO" and selected_model in allowed_models:
+        return selected_model, "사용자 지정 모델"
+
+    return select_model(message)
+
+
 def build_context(history: List[Dict[str, str]], max_messages: int = 10) -> str:
     lines = []
     for msg in history[-max_messages:]:
@@ -263,11 +271,7 @@ def build_context(history: List[Dict[str, str]], max_messages: int = 10) -> str:
 
 
 def extract_code_block(text: str) -> str:
-    patterns = [
-        r"```python\n(.*?)```",
-        r"```py\n(.*?)```",
-        r"```\n(.*?)```",
-    ]
+    patterns = [r"```python\n(.*?)```", r"```py\n(.*?)```", r"```\n(.*?)```"]
     matches = []
     for pattern in patterns:
         matches.extend(re.findall(pattern, text, flags=re.DOTALL | re.IGNORECASE))
@@ -293,29 +297,39 @@ def save_code(code: str, path_text: str) -> str:
     return f"저장 완료: {target}"
 
 
-def run_python(path_text: str) -> str:
+def run_python_detail(path_text: str) -> dict:
     target = safe_project_path(path_text)
+
     if not target.exists():
-        return f"실행 실패: 파일이 없습니다: {target}"
+        return {"ok": False, "output": f"실행 실패: 파일이 없습니다: {target}", "returncode": -1}
+
     if target.suffix.lower() != ".py":
-        return "실행 실패: 현재는 .py 파일만 실행 지원합니다."
+        return {"ok": False, "output": "실행 실패: 현재는 .py 파일만 실행 지원합니다.", "returncode": -1}
 
-    result = subprocess.run(
-        ["python", str(target)],
-        cwd=str(BASE),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            ["python", str(target)],
+            cwd=str(BASE),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
 
-    output = f"실행 파일: {target}\n종료 코드: {result.returncode}\n\n"
-    if result.stdout:
-        output += "[STDOUT]\n" + result.stdout + "\n"
-    if result.stderr:
-        output += "[STDERR]\n" + result.stderr + "\n"
-    if not result.stdout and not result.stderr:
-        output += "출력 없음\n"
-    return output
+        output = f"실행 파일: {target}\n종료 코드: {result.returncode}\n\n"
+        if result.stdout:
+            output += "[STDOUT]\n" + result.stdout + "\n"
+        if result.stderr:
+            output += "[STDERR]\n" + result.stderr + "\n"
+        if not result.stdout and not result.stderr:
+            output += "출력 없음\n"
+
+        return {"ok": result.returncode == 0, "output": output, "returncode": result.returncode}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "output": "실행 중단: 120초 시간 초과", "returncode": -1}
+
+
+def run_python(path_text: str) -> str:
+    return run_python_detail(path_text)["output"]
 
 
 def make_prompt(message: str, history: List[Dict[str, str]], model: str, reason: str) -> str:
@@ -349,161 +363,113 @@ def make_prompt(message: str, history: List[Dict[str, str]], model: str, reason:
 """
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "AURUM v2 API"}
+def auto_fix_code(original_message: str, code: str, run_output: str, code_path: str, max_rounds: int = 2) -> tuple[str, str, str]:
+    current_code = code
+    logs = []
+
+    for round_no in range(1, max_rounds + 1):
+        fix_prompt = f"""
+너는 AURUM 코드 자동 수정 AI다.
+아래 Python 코드가 실행 실패했다.
+에러 로그를 분석해서 수정된 전체 Python 코드만 하나의 코드블록으로 출력하라.
+
+규칙:
+- 반드시 Python 전체 코드만 제공한다.
+- 코드블록 안에는 설명을 넣지 않는다.
+- Docker 프로젝트 루트는 /app 이다.
+- 상대경로를 우선 사용한다.
+- Python 3.12 기준이다.
+
+사용자 원래 요청:
+{original_message}
+
+현재 저장 경로:
+{code_path}
+
+실패한 코드:
+```python
+{current_code}
+
+# ===== AURUM 자동 코드 수정 루프 추가 =====
+
+def auto_fix_code_once(original_message: str, code: str, run_output: str, code_path: str) -> tuple[str, str]:
+    prompt = f"""
+너는 Python 코드 자동 수정 AI다.
+아래 코드는 실행 실패했다.
+에러 로그를 보고 수정된 전체 Python 코드만 코드블록으로 출력하라.
+
+규칙:
+- 설명 금지
+- 전체 코드만 제공
+- Python 3.12 기준
+- Docker 프로젝트 루트는 /app
+
+사용자 요청:
+{original_message}
+
+저장 경로:
+{code_path}
+
+실패한 코드:
+{code}
+
+실행 로그:
+{run_output}
+"""
+
+    fixed_answer = call_ollama(MODEL_WORK, prompt, timeout=600)
+    fixed_code = extract_code_block(fixed_answer)
+
+    if not fixed_code:
+        return code, "[자동 수정 실패] 수정 코드블록을 감지하지 못했습니다."
+
+    save_code(fixed_code, code_path)
+    result = run_python(code_path)
+
+    return fixed_code, result
 
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+_original_chat = chat
 
 
-@app.get("/memory")
-def get_memory():
-    return load_memory()
+@app.post("/chat-auto", response_model=ChatResponse)
+def chat_auto(req: ChatRequest):
+    res = _original_chat(req)
 
+    if not res.last_code:
+        return res
 
-@app.post("/memory")
-def update_memory(req: MemoryUpdateRequest):
-    mem = load_memory()
-    if req.summary.strip():
-        mem["summary"] = req.summary.strip()
-    if req.facts:
-        mem["facts"] = [x.strip() for x in req.facts if x.strip()]
-    save_memory(mem)
-    return mem
+    if not res.run_result.strip():
+        return res
 
+    if "종료 코드: 0" in res.run_result:
+        return res
 
-@app.delete("/memory")
-def clear_memory():
-    mem = default_memory()
-    save_memory(mem)
-    return mem
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    message = req.message.strip()
-    history = list(req.history or [])
-
-    if not message:
-        return ChatResponse(
-            answer="메시지가 비어 있습니다.",
-            model="none",
-            reason="empty",
-            history=history,
-            last_code=req.last_code,
-            code_path=req.code_path,
-            memory_summary=load_memory().get("summary", ""),
-        )
-
-    allowed_models = {
-        "llama3.1:8b",
-        "qwen2.5:14b",
-        "qwen2.5:72b",
-        "llama3.1:70b",
-        "llava:latest",
-        "gemma2:27b",
-        "gemma2:9b",
-        "gemma:7b",
-    }
-
-    if req.selected_model and req.selected_model != "AUTO" and req.selected_model in allowed_models:
-        model = req.selected_model
-        reason = "사용자 지정 모델"
-    else:
-        model, reason = select_model(message)
-    history.append({"role": "user", "content": message})
-
-    if "저장해" in message or "코드 저장" in message:
-        result = save_code(req.last_code, req.code_path)
-        answer = f"[AURUM 코드 저장]\n{result}"
-        history.append({"role": "assistant", "content": answer})
-        update_memory_from_chat(history)
-        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 저장 명령", history=history, last_code=req.last_code, code_path=req.code_path, memory_summary=load_memory().get("summary", ""))
-
-    if "실행해" in message or "테스트해" in message or "돌려봐" in message:
-        run_result = run_python(req.code_path)
-        answer = f"[AURUM 코드 실행]\n{run_result}"
-        history.append({"role": "assistant", "content": answer})
-        update_memory_from_chat(history)
-        return ChatResponse(answer=answer, model="SYSTEM", reason="코드 실행 명령", history=history, last_code=req.last_code, code_path=req.code_path, run_result=run_result, memory_summary=load_memory().get("summary", ""))
-
-    if model == "WEATHER_API":
-        answer = get_weather()
-        history.append({"role": "assistant", "content": answer})
-        update_memory_from_chat(history)
-        return ChatResponse(answer=answer, model=model, reason=reason, history=history, last_code=req.last_code, code_path=req.code_path, memory_summary=load_memory().get("summary", ""))
-
-    prompt = make_prompt(message, req.history, model, reason)
-    answer = call_ollama(model, prompt)
-
-    code = extract_code_block(answer)
-    run_result = ""
-    last_code = req.last_code
-    code_path = req.code_path
-
-    if code:
-        last_code = code
-        save_result = save_code(code, code_path)
-        run_result = run_python(code_path)
-        answer += f"\n\n[AURUM 자동 처리]\n1. 코드 감지 완료\n2. {save_result}\n3. 실행 결과:\n{run_result}"
-
-    history.append({"role": "assistant", "content": answer})
-    mem = update_memory_from_chat(history)
-
-    return ChatResponse(
-        answer=answer,
-        model=model,
-        reason=reason,
-        history=history,
-        last_code=last_code,
-        code_path=code_path,
-        run_result=run_result,
-        memory_summary=mem.get("summary", ""),
+    fixed_code, fixed_result = auto_fix_code_once(
+        req.message,
+        res.last_code,
+        res.run_result,
+        res.code_path,
     )
 
+    final_answer = (
+        res.answer
+        + "\n\n[AURUM 자동 수정 루프]\n"
+        + fixed_result
+    )
 
-@app.post("/tools/image-ocr")
-def tool_image_ocr(file: UploadFile = File(...)):
-    path = save_upload(file)
-    run_cmd(["python", str(SCRIPTS / "taxa_table_ocr.py"), str(path)])
-    out = OUTPUTS / f"{path.stem}_taxa.xlsx"
-    return {"status": "ok", "message": "이미지 OCR 완료", "file": out.name, "url": output_url(out)}
+    new_history = list(res.history)
+    if new_history and new_history[-1].get("role") == "assistant":
+        new_history[-1]["content"] = final_answer
 
+    return ChatResponse(
+        answer=final_answer,
+        model=res.model,
+        reason=res.reason + " + 자동 수정",
+        history=new_history,
+        last_code=fixed_code,
+        code_path=res.code_path,
+        run_result=fixed_result,
+        memory_summary=res.memory_summary,
+    )
 
-@app.post("/tools/pdf-ocr")
-def tool_pdf_ocr(file: UploadFile = File(...), pages: str = Form("1")):
-    path = save_upload(file)
-    page_text = pages.strip() if pages and pages.strip() else ""
-    run_cmd(["python", str(SCRIPTS / "taxa_pdf_ocr.py"), str(path), page_text])
-    safe_pages = page_text.replace(",", "_").replace("-", "to").replace(" ", "") if page_text else "all"
-    out = OUTPUTS / f"{path.stem}_pages_{safe_pages}_taxa.xlsx"
-    return {"status": "ok", "message": "PDF OCR 완료", "file": out.name, "url": output_url(out)}
-
-
-@app.post("/tools/cad-kml")
-def tool_cad_kml(file: UploadFile = File(...)):
-    path = save_upload(file)
-    ext = path.suffix.lower()
-
-    if ext == ".kml":
-        mode = "kml_to_dxf"
-        out = OUTPUTS / f"{path.stem}.dxf"
-    elif ext == ".dxf":
-        mode = "dxf_to_kml"
-        out = OUTPUTS / f"{path.stem}.kml"
-    else:
-        return {"status": "error", "message": "KML 또는 DXF 파일만 지원합니다."}
-
-    log = run_cmd(["python", str(SCRIPTS / "cad_kml_convert.py"), mode, str(path), str(out)])
-    return {"status": "ok", "message": "CAD/KML 변환 완료", "file": out.name, "url": output_url(out), "log": log}
-
-
-@app.post("/tools/excel")
-def tool_excel(file: UploadFile = File(...)):
-    path = save_upload(file)
-    run_cmd(["python", str(SCRIPTS / "excel_summary.py"), str(path)])
-    out = OUTPUTS / f"{path.stem}_summary.xlsx"
-    return {"status": "ok", "message": "Excel 분석 완료", "file": out.name, "url": output_url(out)}

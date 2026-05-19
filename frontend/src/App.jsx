@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import "./style.css";
 
 const API_BASE = "http://100.98.149.128:7870";
-const CHAT_URL = `${API_BASE}/chat`;
+const CHAT_URL = `${API_BASE}/chat-auto`;
 
 function App() {
   const [tab, setTab] = useState("chat");
